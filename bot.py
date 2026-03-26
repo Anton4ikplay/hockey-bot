@@ -10,25 +10,27 @@ import time
 import threading
 from flask import Flask
 
-# ============ НАСТРОЙКИ (БЕРЕМ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ) ============
+# ============ НАСТРОЙКИ ============
 TOKEN = os.environ.get('BOT_TOKEN', '8660924656:AAGYp9c_ifO-bBiGc1ytpksFHQdof2yIRP0')
 ADMIN_ID = int(os.environ.get('ADMIN_ID', 5706071030))
-# ===================================================================
+# ===================================
 
 bot = telebot.TeleBot(TOKEN)
 
-# ============ СОЗДАНИЕ БАЗЫ ДАННЫХ ============
+# ============ БАЗА ДАННЫХ ============
 def init_db():
     conn = sqlite3.connect('hockey_bets.db')
     cursor = conn.cursor()
     
-    cursor.execute(''')
+    cursor.execute('''
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
         username TEXT,
         balance REAL DEFAULT 1000.0,
         registration_date TEXT,
-        promo_codes_used TEXT DEFAULT '[]'
+        promo_codes_used TEXT DEFAULT '[]',
+        last_roulette_time TEXT DEFAULT NULL,
+        roulette_wins INTEGER DEFAULT 0
     )
     ''')
     
@@ -72,6 +74,22 @@ def init_db():
     conn.commit()
     conn.close()
 
+def update_db_roulette():
+    conn = sqlite3.connect('hockey_bets.db')
+    cursor = conn.cursor()
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN last_roulette_time TEXT DEFAULT NULL")
+        print("✅ Добавлен столбец last_roulette_time")
+    except:
+        pass
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN roulette_wins INTEGER DEFAULT 0")
+        print("✅ Добавлен столбец roulette_wins")
+    except:
+        pass
+    conn.commit()
+    conn.close()
+
 def add_demo_matches():
     conn = sqlite3.connect('hockey_bets.db')
     cursor = conn.cursor()
@@ -83,10 +101,7 @@ def add_demo_matches():
             ('Ак Барс', 'Салават Юлаев', (datetime.now() + timedelta(days=2)).strftime('%Y-%m-%d %H:%M'), 1.8, 2.3, 3.2),
             ('Динамо М', 'Локомотив', (datetime.now() + timedelta(days=3)).strftime('%Y-%m-%d %H:%M'), 2.2, 1.9, 3.4),
         ]
-        cursor.executemany('''
-        INSERT INTO matches (team1, team2, match_date, coeff_win1, coeff_win2, coeff_draw)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ''', matches)
+        cursor.executemany('INSERT INTO matches (team1, team2, match_date, coeff_win1, coeff_win2, coeff_draw) VALUES (?, ?, ?, ?, ?, ?)', matches)
         conn.commit()
     conn.close()
 
@@ -101,10 +116,7 @@ def add_demo_promocodes():
             ('HOCKEY50', 50.0, 1, (datetime.now() + timedelta(days=15)).strftime('%Y-%m-%d'), 50, 0),
             ('BONUS200', 200.0, 1, (datetime.now() + timedelta(days=7)).strftime('%Y-%m-%d'), 20, 0),
         ]
-        cursor.executemany('''
-        INSERT INTO promo_codes (code, reward, is_active, expiry_date, uses_limit, uses_count)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ''', promos)
+        cursor.executemany('INSERT INTO promo_codes (code, reward, is_active, expiry_date, uses_limit, uses_count) VALUES (?, ?, ?, ?, ?, ?)', promos)
         conn.commit()
     conn.close()
 
@@ -150,15 +162,56 @@ def get_active_matches():
     conn = sqlite3.connect('hockey_bets.db')
     cursor = conn.cursor()
     now = datetime.now().strftime('%Y-%m-%d %H:%M')
-    cursor.execute('''
-    SELECT match_id, team1, team2, match_date, coeff_win1, coeff_win2, coeff_draw
-    FROM matches WHERE status = 'upcoming' AND match_date > ? ORDER BY match_date
-    ''', (now,))
+    cursor.execute('SELECT match_id, team1, team2, match_date, coeff_win1, coeff_win2, coeff_draw FROM matches WHERE status = "upcoming" AND match_date > ? ORDER BY match_date', (now,))
     matches = cursor.fetchall()
     conn.close()
     return matches
 
-# ============ ГЛАВНОЕ МЕНЮ (ИНЛАЙН КНОПКИ) ============
+# ============ ФУНКЦИИ РУЛЕТКИ (КД 4 ЧАСА) ============
+def can_play_roulette(user_id):
+    """Проверяет, может ли пользователь играть в рулетку (прошло ли 4 часа)"""
+    conn = sqlite3.connect('hockey_bets.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT last_roulette_time FROM users WHERE user_id = ?", (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+    if not result or not result[0]:
+        return True, None
+    last_game = datetime.strptime(result[0], '%Y-%m-%d %H:%M:%S')
+    next_available = last_game + timedelta(hours=4)  # ИЗМЕНЕНО НА 4 ЧАСА
+    now = datetime.now()
+    if now >= next_available:
+        return True, None
+    else:
+        wait_time = next_available - now
+        hours = int(wait_time.total_seconds() // 3600)
+        minutes = int((wait_time.total_seconds() % 3600) // 60)
+        return False, f"{hours}ч {minutes}м"
+
+def update_roulette_time(user_id):
+    conn = sqlite3.connect('hockey_bets.db')
+    cursor = conn.cursor()
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    cursor.execute("UPDATE users SET last_roulette_time = ? WHERE user_id = ?", (now, user_id))
+    conn.commit()
+    conn.close()
+
+def update_roulette_win(user_id):
+    conn = sqlite3.connect('hockey_bets.db')
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET roulette_wins = roulette_wins + 1 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+def get_roulette_stats(user_id):
+    conn = sqlite3.connect('hockey_bets.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT roulette_wins FROM users WHERE user_id = ?", (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return result[0] if result else 0
+
+# ============ КЛАВИАТУРА ============
 def main_menu_keyboard():
     keyboard = types.InlineKeyboardMarkup(row_width=2)
     btn_matches = types.InlineKeyboardButton(text="🏒 Матчи", callback_data="menu_matches")
@@ -166,55 +219,47 @@ def main_menu_keyboard():
     btn_balance = types.InlineKeyboardButton(text="💰 Баланс", callback_data="menu_balance")
     btn_bets = types.InlineKeyboardButton(text="📊 Мои ставки", callback_data="menu_bets")
     btn_top = types.InlineKeyboardButton(text="🏆 Топ игроков", callback_data="menu_top")
-    keyboard.add(btn_matches, btn_promo, btn_balance, btn_bets, btn_top)
+    btn_roulette = types.InlineKeyboardButton(text="🎰 Рулетка Джекпот", callback_data="menu_roulette")
+    keyboard.add(btn_matches, btn_promo, btn_balance, btn_bets, btn_top, btn_roulette)
+    return keyboard
+
+def back_to_menu_keyboard():
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(types.InlineKeyboardButton(text="◀️ Назад в меню", callback_data="back_to_menu"))
     return keyboard
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     user_id = message.from_user.id
     username = message.from_user.username
-    
     conn = sqlite3.connect('hockey_bets.db')
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
     user = cursor.fetchone()
-    
     if not user:
         registration_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        cursor.execute('INSERT INTO users (user_id, username, registration_date) VALUES (?, ?, ?)', 
-                      (user_id, username, registration_date))
+        cursor.execute('INSERT INTO users (user_id, username, registration_date) VALUES (?, ?, ?)', (user_id, username, registration_date))
         conn.commit()
-        welcome_text = "🏒 **Добро пожаловать в HockeyBet Bot!**\n\n🎉 Вам начислен **1000 ₽** на баланс!\n\n📝 Выберите действие в меню ниже:"
+        welcome_text = "🏒 **Добро пожаловать в HockeyBet Bot!**\n\n🎉 Вам начислен **1000 ₽** на баланс!\n\n🎰 **Новая игра!** Рулетка Джекпот — бесплатно! Шанс 5% выиграть 250 ₽!\n⏰ Играть можно раз в **4 часа**!\n\n📝 Выберите действие в меню ниже:"
     else:
-        welcome_text = "🏒 **С возвращением!**\n\n📝 Выберите действие в меню ниже:"
-    
+        welcome_text = "🏒 **С возвращением!**\n\n🎰 Попробуй новую бесплатную игру **Рулетка Джекпот**!\n⏰ Играть можно раз в **4 часа**!\n\n📝 Выберите действие в меню ниже:"
     conn.close()
     bot.send_message(message.chat.id, welcome_text, reply_markup=main_menu_keyboard(), parse_mode='Markdown')
 
-# ============ ОБРАБОТЧИКИ ГЛАВНОГО МЕНЮ ============
+# ============ ОБРАБОТЧИКИ МЕНЮ ============
 @bot.callback_query_handler(func=lambda call: call.data == "menu_matches")
 def menu_matches(call):
     matches = get_active_matches()
-    
     if not matches:
-        bot.edit_message_text("📭 На данный момент нет доступных матчей.", 
-                             call.message.chat.id, call.message.message_id,
-                             reply_markup=back_to_menu_keyboard())
+        bot.edit_message_text("📭 Нет доступных матчей.", call.message.chat.id, call.message.message_id, reply_markup=back_to_menu_keyboard())
         return
-    
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     for match in matches:
         match_id, team1, team2, match_date, coeff1, coeff2, coeff_draw = match
-        btn = types.InlineKeyboardButton(
-            text=f"⚡ {team1} vs {team2} | {match_date[:10]}",
-            callback_data=f"match_{match_id}"
-        )
+        btn = types.InlineKeyboardButton(text=f"⚡ {team1} vs {team2} | {match_date[:10]}", callback_data=f"match_{match_id}")
         keyboard.add(btn)
-    
     keyboard.add(types.InlineKeyboardButton(text="◀️ Назад в меню", callback_data="back_to_menu"))
-    bot.edit_message_text("🏒 **Доступные матчи:**", 
-                         call.message.chat.id, call.message.message_id,
-                         reply_markup=keyboard, parse_mode='Markdown')
+    bot.edit_message_text("🏒 **Доступные матчи:**", call.message.chat.id, call.message.message_id, reply_markup=keyboard, parse_mode='Markdown')
 
 @bot.callback_query_handler(func=lambda call: call.data == "menu_promo")
 def menu_promo(call):
@@ -222,9 +267,7 @@ def menu_promo(call):
     btn_activate = types.InlineKeyboardButton(text="🎫 Активировать промокод", callback_data="activate_promo")
     keyboard.add(btn_activate)
     keyboard.add(types.InlineKeyboardButton(text="◀️ Назад в меню", callback_data="back_to_menu"))
-    bot.edit_message_text("🎁 **Введите промокод для активации бонуса:**", 
-                         call.message.chat.id, call.message.message_id,
-                         reply_markup=keyboard, parse_mode='Markdown')
+    bot.edit_message_text("🎁 **Введите промокод для активации бонуса:**", call.message.chat.id, call.message.message_id, reply_markup=keyboard, parse_mode='Markdown')
 
 @bot.callback_query_handler(func=lambda call: call.data == "menu_balance")
 def menu_balance(call):
@@ -233,23 +276,15 @@ def menu_balance(call):
     cursor.execute("SELECT balance FROM users WHERE user_id = ?", (call.from_user.id,))
     balance = cursor.fetchone()[0]
     conn.close()
-    
-    text = f"💰 **Ваш баланс:** {balance} ₽"
-    bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
-                         reply_markup=back_to_menu_keyboard(), parse_mode='Markdown')
+    bot.edit_message_text(f"💰 **Ваш баланс:** {balance} ₽", call.message.chat.id, call.message.message_id, reply_markup=back_to_menu_keyboard(), parse_mode='Markdown')
 
 @bot.callback_query_handler(func=lambda call: call.data == "menu_bets")
 def menu_bets(call):
     conn = sqlite3.connect('hockey_bets.db')
     cursor = conn.cursor()
-    cursor.execute('''
-    SELECT m.team1, m.team2, b.bet_type, b.amount, b.potential_win, b.status, b.bet_date
-    FROM bets b JOIN matches m ON b.match_id = m.match_id
-    WHERE b.user_id = ? ORDER BY b.bet_date DESC LIMIT 10
-    ''', (call.from_user.id,))
+    cursor.execute('SELECT m.team1, m.team2, b.bet_type, b.amount, b.potential_win, b.status, b.bet_date FROM bets b JOIN matches m ON b.match_id = m.match_id WHERE b.user_id = ? ORDER BY b.bet_date DESC LIMIT 10', (call.from_user.id,))
     bets = cursor.fetchall()
     conn.close()
-    
     if not bets:
         text = "📭 У вас пока нет ставок."
     else:
@@ -263,13 +298,8 @@ def menu_bets(call):
             else:
                 bet_text = "Ничья"
             status_emoji = "🟡" if status == "active" else "✅" if status == "won" else "❌"
-            text += f"{status_emoji} {team1} vs {team2}\n"
-            text += f"Ставка: {bet_text} | {amount} ₽\n"
-            text += f"Потенц.: {potential} ₽\n"
-            text += f"📅 {date[:16]}\n\n"
-    
-    bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
-                         reply_markup=back_to_menu_keyboard(), parse_mode='Markdown')
+            text += f"{status_emoji} {team1} vs {team2}\nСтавка: {bet_text} | {amount} ₽\nПотенц.: {potential} ₽\n📅 {date[:16]}\n\n"
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=back_to_menu_keyboard(), parse_mode='Markdown')
 
 @bot.callback_query_handler(func=lambda call: call.data == "menu_top")
 def menu_top(call):
@@ -278,7 +308,6 @@ def menu_top(call):
     cursor.execute('SELECT username, balance FROM users ORDER BY balance DESC LIMIT 10')
     players = cursor.fetchall()
     conn.close()
-    
     if not players:
         text = "📭 Нет игроков."
     else:
@@ -286,120 +315,74 @@ def menu_top(call):
         for i, (username, balance) in enumerate(players, 1):
             medal = "🥇 " if i == 1 else "🥈 " if i == 2 else "🥉 " if i == 3 else f"{i}. "
             text += f"{medal}@{username or 'Аноним'} — {balance} ₽\n"
-    
-    bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
-                         reply_markup=back_to_menu_keyboard(), parse_mode='Markdown')
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=back_to_menu_keyboard(), parse_mode='Markdown')
 
 @bot.callback_query_handler(func=lambda call: call.data == "back_to_menu")
 def back_to_menu(call):
-    bot.edit_message_text("🏒 **Главное меню HockeyBet Bot**\n\nВыберите действие:",
-                         call.message.chat.id, call.message.message_id,
-                         reply_markup=main_menu_keyboard(), parse_mode='Markdown')
-
-def back_to_menu_keyboard():
-    keyboard = types.InlineKeyboardMarkup()
-    keyboard.add(types.InlineKeyboardButton(text="◀️ Назад в меню", callback_data="back_to_menu"))
-    return keyboard
+    bot.edit_message_text("🏒 **Главное меню HockeyBet Bot**\n\nВыберите действие:", call.message.chat.id, call.message.message_id, reply_markup=main_menu_keyboard(), parse_mode='Markdown')
 
 # ============ ОБРАБОТКА МАТЧЕЙ ============
 @bot.callback_query_handler(func=lambda call: call.data.startswith('match_'))
 def handle_match(call):
     match_id = int(call.data.split('_')[1])
-    
     conn = sqlite3.connect('hockey_bets.db')
     cursor = conn.cursor()
-    cursor.execute('''
-    SELECT team1, team2, match_date, coeff_win1, coeff_win2, coeff_draw
-    FROM matches WHERE match_id = ?
-    ''', (match_id,))
+    cursor.execute('SELECT team1, team2, match_date, coeff_win1, coeff_win2, coeff_draw FROM matches WHERE match_id = ?', (match_id,))
     match = cursor.fetchone()
     conn.close()
-    
     if match:
         team1, team2, match_date, coeff1, coeff2, coeff_draw = match
-        
         keyboard = types.InlineKeyboardMarkup(row_width=2)
         btn_win1 = types.InlineKeyboardButton(text=f"🏒 {team1} ({coeff1})", callback_data=f"bet_{match_id}_win1_{coeff1}")
         btn_win2 = types.InlineKeyboardButton(text=f"🏒 {team2} ({coeff2})", callback_data=f"bet_{match_id}_win2_{coeff2}")
         btn_draw = types.InlineKeyboardButton(text=f"🤝 Ничья ({coeff_draw})", callback_data=f"bet_{match_id}_draw_{coeff_draw}")
         btn_back = types.InlineKeyboardButton(text="◀️ Назад к матчам", callback_data="menu_matches")
         keyboard.add(btn_win1, btn_win2, btn_draw, btn_back)
-        
         match_info = f"🏒 **{team1} vs {team2}**\n📅 {match_date}\n\n💰 **Коэффициенты:**\n• {team1}: {coeff1}\n• {team2}: {coeff2}\n• Ничья: {coeff_draw}\n\nВыберите исход для ставки:"
-        
-        bot.edit_message_text(match_info, call.message.chat.id, call.message.message_id,
-                             reply_markup=keyboard, parse_mode='Markdown')
+        bot.edit_message_text(match_info, call.message.chat.id, call.message.message_id, reply_markup=keyboard, parse_mode='Markdown')
 
-# ============ ОБРАБОТКА СТАВОК ============
 @bot.callback_query_handler(func=lambda call: call.data.startswith('bet_'))
 def place_bet(call):
     data = call.data.split('_')
     match_id = int(data[1])
     bet_type = data[2]
     coeff = float(data[3])
-    
-    user_data = {
-        'match_id': match_id,
-        'bet_type': bet_type,
-        'coeff': coeff,
-        'message_id': call.message.message_id
-    }
-    
+    user_data = {'match_id': match_id, 'bet_type': bet_type, 'coeff': coeff}
     msg = bot.send_message(call.message.chat.id, "💰 Введите сумму ставки (минимум 10 ₽):")
     bot.register_next_step_handler(msg, process_bet_amount, user_data, call.message.chat.id)
 
 def process_bet_amount(message, user_data, chat_id):
     try:
         amount = float(message.text)
-        
         if amount < 10:
             bot.send_message(message.chat.id, "❌ Минимальная сумма ставки - 10 ₽!")
             return
-        
         conn = sqlite3.connect('hockey_bets.db')
         cursor = conn.cursor()
-        
         cursor.execute("SELECT balance FROM users WHERE user_id = ?", (message.from_user.id,))
         balance = cursor.fetchone()[0]
-        
         if amount > balance:
             bot.send_message(message.chat.id, f"❌ Недостаточно средств! Ваш баланс: {balance} ₽")
             conn.close()
             return
-        
         cursor.execute("UPDATE users SET balance = balance - ? WHERE user_id = ?", (amount, message.from_user.id))
-        
         potential_win = amount * user_data['coeff']
         bet_date = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        
-        cursor.execute('''
-        INSERT INTO bets (user_id, match_id, bet_type, amount, potential_win, bet_date)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ''', (message.from_user.id, user_data['match_id'], user_data['bet_type'], amount, potential_win, bet_date))
-        
+        cursor.execute('INSERT INTO bets (user_id, match_id, bet_type, amount, potential_win, bet_date) VALUES (?, ?, ?, ?, ?, ?)', (message.from_user.id, user_data['match_id'], user_data['bet_type'], amount, potential_win, bet_date))
         conn.commit()
-        
         cursor.execute("SELECT team1, team2 FROM matches WHERE match_id = ?", (user_data['match_id'],))
         team1, team2 = cursor.fetchone()
-        
-        bet_type_text = ""
+        bet_type_text = "Ничья"
         if user_data['bet_type'] == 'win1':
             bet_type_text = team1
         elif user_data['bet_type'] == 'win2':
             bet_type_text = team2
-        else:
-            bet_type_text = "Ничья"
-        
         conn.close()
-        
         result_text = f"✅ **Ставка принята!**\n\n📊 **Информация:**\n• Матч: {team1} vs {team2}\n• Исход: {bet_type_text}\n• Сумма: {amount} ₽\n• Коэффициент: {user_data['coeff']}\n• Потенциальный выигрыш: {potential_win} ₽\n\nУдачи!"
-        
         bot.send_message(message.chat.id, result_text, parse_mode='Markdown', reply_markup=back_to_menu_keyboard())
-        
     except ValueError:
         bot.send_message(message.chat.id, "❌ Введите корректную сумму!")
 
-# ============ АКТИВАЦИЯ ПРОМОКОДА ============
 @bot.callback_query_handler(func=lambda call: call.data == "activate_promo")
 def activate_promo_menu(call):
     msg = bot.send_message(call.message.chat.id, "📝 Введите промокод:")
@@ -408,13 +391,145 @@ def activate_promo_menu(call):
 def process_promo_activation(message, chat_id, original_msg_id):
     code = message.text.strip().upper()
     success, result = activate_promo_code(message.from_user.id, code)
-    
     try:
         bot.delete_message(chat_id, original_msg_id)
     except:
         pass
-    
     bot.send_message(message.chat.id, result, reply_markup=back_to_menu_keyboard())
+
+# ============ РУЛЕТКА (КД 4 ЧАСА) ============
+@bot.callback_query_handler(func=lambda call: call.data == "menu_roulette")
+def menu_roulette(call):
+    user_id = call.from_user.id
+    can_play, wait_time = can_play_roulette(user_id)
+    wins = get_roulette_stats(user_id)
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    if can_play:
+        btn_play = types.InlineKeyboardButton(text="🎰 КРУТИТЬ РУЛЕТКУ (БЕСПЛАТНО!)", callback_data="play_roulette")
+    else:
+        btn_play = types.InlineKeyboardButton(text=f"⏰ Доступно через {wait_time}", callback_data="no_roulette")
+    btn_stats = types.InlineKeyboardButton(text="📊 Моя статистика", callback_data="roulette_stats")
+    btn_rules = types.InlineKeyboardButton(text="📖 Правила", callback_data="roulette_rules")
+    btn_back = types.InlineKeyboardButton(text="◀️ Назад в меню", callback_data="back_to_menu")
+    keyboard.add(btn_play, btn_stats, btn_rules, btn_back)
+    text = f"""🎰 **РУЛЕТКА ДЖЕКПОТ**
+
+🎲 **Правила:**
+• Стоимость игры: **БЕСПЛАТНО!**
+• Шанс на джекпот: **5%**
+• Джекпот: **250 ₽**
+• ⏰ **Перезарядка: 4 ЧАСА**
+
+📊 **Ваша статистика:**
+• Побед в рулетке: {wins}
+• Всего выиграно: {wins * 250} ₽
+
+💡 Просто нажми кнопку и попробуй удачу!"""
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=keyboard, parse_mode='Markdown')
+
+@bot.callback_query_handler(func=lambda call: call.data == "roulette_stats")
+def roulette_stats(call):
+    user_id = call.from_user.id
+    wins = get_roulette_stats(user_id)
+    text = f"""📊 **СТАТИСТИКА РУЛЕТКИ**
+
+🎰 Ваши победы: **{wins}**
+💰 Всего выиграно: **{wins * 250} ₽**
+🎯 Шанс на джекпот: 5% (1 раз из 20)
+
+🆓 Игра бесплатная!
+⏰ Перезарядка: 4 часа"""
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(types.InlineKeyboardButton(text="◀️ Назад", callback_data="menu_roulette"))
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=keyboard, parse_mode='Markdown')
+
+@bot.callback_query_handler(func=lambda call: call.data == "roulette_rules")
+def roulette_rules(call):
+    text = """📖 **ПРАВИЛА РУЛЕТКИ ДЖЕКПОТ**
+
+🎲 **Как играть:**
+1. Нажми кнопку **"КРУТИТЬ РУЛЕТКУ"**
+2. Рулетка случайным образом выбирает число от 1 до 100
+3. Если выпадает число **1, 2, 3, 4 или 5** (5 чисел из 100 = 5%) — **ДЖЕКПОТ!**
+
+💰 **Выигрыш:**
+• Джекпот: **250 ₽**
+
+🆓 **Стоимость:** БЕСПЛАТНО!
+
+⏰ **Ограничения:**
+• Играть можно **1 раз в 4 ЧАСА**
+
+🎯 **Шанс на выигрыш:** 5%
+
+Удачи! 🍀"""
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(types.InlineKeyboardButton(text="◀️ Назад", callback_data="menu_roulette"))
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=keyboard, parse_mode='Markdown')
+
+@bot.callback_query_handler(func=lambda call: call.data == "play_roulette")
+def play_roulette(call):
+    user_id = call.from_user.id
+    can_play, wait_time = can_play_roulette(user_id)
+    if not can_play:
+        bot.answer_callback_query(call.id, f"⏰ Следующая игра через {wait_time}!", show_alert=True)
+        return
+    update_roulette_time(user_id)
+    lucky_number = random.randint(1, 100)
+    winning_numbers = [1, 2, 3, 4, 5]
+    animation_frames = ["🎰", "🎲", "🎯", "✨", "🎰"]
+    for frame in animation_frames:
+        try:
+            bot.edit_message_text(f"{frame} **КРУТИМ РУЛЕТКУ...** {frame}", call.message.chat.id, call.message.message_id, parse_mode='Markdown')
+        except:
+            pass
+        time.sleep(0.3)
+    if lucky_number in winning_numbers:
+        win_amount = 250
+        conn = sqlite3.connect('hockey_bets.db')
+        cursor = conn.cursor()
+        cursor.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (win_amount, user_id))
+        cursor.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+        new_balance = cursor.fetchone()[0]
+        conn.commit()
+        conn.close()
+        update_roulette_win(user_id)
+        wins = get_roulette_stats(user_id)
+        keyboard = types.InlineKeyboardMarkup()
+        keyboard.add(types.InlineKeyboardButton(text="🎰 Играть снова (через 4ч)", callback_data="menu_roulette"))
+        keyboard.add(types.InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_to_menu"))
+        result_text = f"""🎉 **ДЖЕКПОТ!** 🎉
+
+✨ Выпало число: **{lucky_number}**
+💰 Вы выиграли: **{win_amount} ₽**
+
+📊 **Ваша статистика:**
+• Побед в рулетке: {wins}
+• Новый баланс: {new_balance} ₽
+
+🍀 Поздравляем!
+⏰ Следующая игра через 4 часа"""
+        bot.edit_message_text(result_text, call.message.chat.id, call.message.message_id, reply_markup=keyboard, parse_mode='Markdown')
+    else:
+        wins = get_roulette_stats(user_id)
+        keyboard = types.InlineKeyboardMarkup()
+        keyboard.add(types.InlineKeyboardButton(text="🎰 Играть снова (через 4ч)", callback_data="menu_roulette"))
+        keyboard.add(types.InlineKeyboardButton(text="🏠 Главное меню", callback_data="back_to_menu"))
+        result_text = f"""😔 **ПОВЕЗЕТ В СЛЕДУЮЩИЙ РАЗ!**
+
+🎲 Выпало число: **{lucky_number}**
+🎯 Выигрышные числа: 1, 2, 3, 4, 5
+📊 Ваша статистика: {wins} побед
+
+🆓 Игра бесплатная!
+⏰ Следующая игра через 4 часа
+
+Попробуй еще раз! 🍀"""
+        bot.edit_message_text(result_text, call.message.chat.id, call.message.message_id, reply_markup=keyboard, parse_mode='Markdown')
+
+@bot.callback_query_handler(func=lambda call: call.data == "no_roulette")
+def no_roulette(call):
+    bot.answer_callback_query(call.id, "⏰ Рулетка недоступна! Подождите 4 часа после предыдущей игры.", show_alert=True)
 
 # ============ АДМИН-КОМАНДЫ ============
 @bot.message_handler(commands=['players'])
@@ -428,16 +543,16 @@ def show_all_players(message):
     total = cursor.fetchone()[0]
     cursor.execute("SELECT SUM(balance) FROM users")
     total_balance = cursor.fetchone()[0] or 0
-    cursor.execute("SELECT user_id, username, balance, registration_date FROM users ORDER BY balance DESC")
+    cursor.execute("SELECT user_id, username, balance, registration_date, roulette_wins FROM users ORDER BY balance DESC")
     players = cursor.fetchall()
     conn.close()
     if not players:
         bot.send_message(message.chat.id, "📭 Нет игроков.")
         return
     text = f"👥 ИГРОКИ: {total}\n💰 Общий баланс: {total_balance} ₽\n📈 Средний: {total_balance/total:.0f} ₽\n\n"
-    for i, (uid, name, bal, reg) in enumerate(players, 1):
+    for i, (uid, name, bal, reg, roulette_wins) in enumerate(players, 1):
         medal = "🥇 " if i == 1 else "🥈 " if i == 2 else "🥉 " if i == 3 else f"{i}. "
-        text += f"{medal}@{name or 'аноним'} — {bal} ₽\n"
+        text += f"{medal}@{name or 'аноним'} — {bal} ₽ | 🎰 {roulette_wins} побед\n"
     bot.send_message(message.chat.id, text[:4000])
 
 @bot.message_handler(commands=['addmoney'])
@@ -524,8 +639,7 @@ def add_match(message):
         match_date = f"{date} {time}"
         conn = sqlite3.connect('hockey_bets.db')
         cursor = conn.cursor()
-        cursor.execute('INSERT INTO matches (team1, team2, match_date, coeff_win1, coeff_win2, coeff_draw) VALUES (?, ?, ?, ?, ?, ?)',
-                      (team1, team2, match_date, c1, c2, c3))
+        cursor.execute('INSERT INTO matches (team1, team2, match_date, coeff_win1, coeff_win2, coeff_draw) VALUES (?, ?, ?, ?, ?, ?)', (team1, team2, match_date, c1, c2, c3))
         conn.commit()
         mid = cursor.lastrowid
         conn.close()
@@ -697,12 +811,12 @@ def all_promos(message):
         text += f"{status} {p[0]}: {p[1]}₽ | {p[3]}/{p[4]} | до {p[2]}\n"
     bot.send_message(message.chat.id, text[:4000])
 
-# ============ ДЛЯ RENDER (ВЕБ-СЕРВЕР ДЛЯ ПОДДЕРЖАНИЯ АКТИВНОСТИ) ============
+# ============ ВЕБ-СЕРВЕР ДЛЯ RENDER ============
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
 def health():
-    return "🏒 HockeyBot is running 24/7 on Render!"
+    return "🏒 HockeyBot is running! 🎰 Рулетка с КД 4 часа!"
 
 @flask_app.route('/ping')
 def ping():
@@ -711,18 +825,19 @@ def ping():
 def run_flask():
     flask_app.run(host='0.0.0.0', port=8080)
 
-# Запускаем веб-сервер в отдельном потоке
 threading.Thread(target=run_flask, daemon=True).start()
 print("🌐 Веб-сервер запущен на порту 8080")
-# =======================================================================
 
-# ============ ЗАПУСК БОТА ============
+# ============ ЗАПУСК ============
 if __name__ == '__main__':
     init_db()
+    update_db_roulette()
     add_demo_matches()
     add_demo_promocodes()
-    print("🤖 Бот успешно запущен на Render!")
-    print("✅ Все кнопки работают через инлайн-меню!")
+    print("🤖 Бот успешно запущен!")
+    print("✅ Добавлена игра: РУЛЕТКА ДЖЕКПОТ!")
+    print("🎰 Шанс выигрыша: 5% | Выигрыш: 250 ₽ | КД: 4 ЧАСА")
+    print("🎮 Кнопка '🎰 Рулетка Джекпот' добавлена в главное меню!")
     
     while True:
         try:
