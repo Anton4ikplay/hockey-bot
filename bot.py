@@ -11,8 +11,8 @@ import threading
 from flask import Flask
 
 # ============ НАСТРОЙКИ (БЕРЕМ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ) ============
-TOKEN = os.environ.get('BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
-ADMIN_ID = int(os.environ.get('ADMIN_ID', 123456789))
+TOKEN = os.environ.get('BOT_TOKEN', '8660924656:AAGYp9c_ifO-bBiGc1ytpksFHQdof2yIRP0')
+ADMIN_ID = int(os.environ.get('ADMIN_ID', 5706071030))
 # ===================================================================
 
 bot = telebot.TeleBot(TOKEN)
@@ -22,7 +22,7 @@ def init_db():
     conn = sqlite3.connect('hockey_bets.db')
     cursor = conn.cursor()
     
-    cursor.execute('''
+    cursor.execute(''')
     CREATE TABLE IF NOT EXISTS users (
         user_id INTEGER PRIMARY KEY,
         username TEXT,
